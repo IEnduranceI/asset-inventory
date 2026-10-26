@@ -1,0 +1,989 @@
+"""Asset Inventory — a local desktop app for tracking networked devices.
+
+Run with: python main.py
+Inventory stays in memory until the user imports or exports a chosen JSON file.
+"""
+from __future__ import annotations
+
+import ipaddress
+import json
+import sqlite3
+import webbrowser
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from pathlib import Path
+
+def format_ip_address(value: str) -> str:
+    try:
+        return ipaddress.ip_address(value.strip()).compressed
+    except ValueError:
+        return value
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS devices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ip_address TEXT NOT NULL,
+    device_type TEXT NOT NULL DEFAULT '',
+    hostname TEXT NOT NULL DEFAULT '',
+    organization TEXT NOT NULL DEFAULT '',
+    connection TEXT NOT NULL DEFAULT 'Internal',
+    user_type TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS device_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    target_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    label TEXT NOT NULL DEFAULT 'Connected',
+    UNIQUE(source_id, target_id, label)
+);
+CREATE TABLE IF NOT EXISTS settings (
+    category TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (category, value)
+);
+"""
+DEFAULTS = {
+    "connection": ["Internal", "External"],
+    "device_type": ["Desktop", "Laptop", "Server", "Printer", "Router", "Switch", "Phone", "Other"],
+    "user_type": ["Admin", "Employee", "Service account", "Shared", "Unknown"],
+}
+
+
+class InventoryDB:
+    def __init__(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript(SCHEMA)
+        self.conn.execute("DELETE FROM device_links WHERE source_id NOT IN (SELECT id FROM devices) OR target_id NOT IN (SELECT id FROM devices)")
+        for category, values in DEFAULTS.items():
+            self.conn.executemany("INSERT OR IGNORE INTO settings(category,value) VALUES (?,?)",
+                                  [(category, value) for value in values])
+        self.conn.commit()
+
+    def choices(self, category: str) -> list[str]:
+        return [r[0] for r in self.conn.execute(
+            "SELECT value FROM settings WHERE category=? ORDER BY value COLLATE NOCASE", (category,))]
+
+    def add_choice(self, category: str, value: str) -> None:
+        self.conn.execute("INSERT OR IGNORE INTO settings(category,value) VALUES (?,?)", (category, value.strip()))
+        self.conn.commit()
+
+    def save(self, values: dict, device_id: int | None = None) -> None:
+        fields = ("ip_address", "device_type", "hostname", "organization", "connection", "user_type", "notes")
+        data = [values.get(k, "").strip() for k in fields]
+        if device_id is None:
+            cursor = self.conn.execute(f"INSERT INTO devices ({','.join(fields)}) VALUES ({','.join('?' for _ in fields)})", data)
+            device_id = cursor.lastrowid
+        else:
+            self.conn.execute(f"UPDATE devices SET {','.join(k+'=?' for k in fields)}, updated_at=CURRENT_TIMESTAMP WHERE id=?", data + [device_id])
+        self.conn.commit()
+        return device_id
+
+    def delete(self, device_id: int) -> None:
+        self.conn.execute("DELETE FROM devices WHERE id=?", (device_id,))
+        self.conn.commit()
+
+    def rows(self, filters: dict) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM devices WHERE 1=1"
+        args: list[str] = []
+        for field, value in filters.items():
+            if value:
+                sql += f" AND {field} LIKE ? COLLATE NOCASE"
+                args.append(f"%{value.strip()}%")
+        sql += " ORDER BY organization COLLATE NOCASE, ip_address COLLATE NOCASE"
+        return list(self.conn.execute(sql, args))
+
+
+    def export_file(self, path: Path) -> None:
+        data = {
+            "format": "asset-inventory",
+            "version": 1,
+            "devices": [dict(row) for row in self.conn.execute("SELECT ip_address, device_type, hostname, organization, connection, user_type, notes FROM devices ORDER BY id")],
+            "categories": {category: self.choices(category) for category in DEFAULTS},
+            "links": [dict(row) for row in self.conn.execute("SELECT a.ip_address AS source_ip, b.ip_address AS target_ip, l.label FROM device_links l JOIN devices a ON a.id=l.source_id JOIN devices b ON b.id=l.target_id ORDER BY l.id")],
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def import_file(self, path: Path) -> int:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("format") != "asset-inventory" or not isinstance(data.get("devices"), list):
+            raise ValueError("This file is not a supported Asset Inventory file.")
+        fields = ("ip_address", "device_type", "hostname", "organization", "connection", "user_type", "notes")
+        for index, row in enumerate(data["devices"], 1):
+            if not isinstance(row, dict) or not str(row.get("ip_address", "")).strip():
+                raise ValueError(f"Device {index} must include an IP address.")
+            try:
+                ipaddress.ip_address(str(row["ip_address"]).strip())
+            except ValueError as exc:
+                raise ValueError(f"Device {index} has an invalid IP address. Use a valid IP address.") from exc
+        with self.conn:
+            self.conn.execute("DELETE FROM device_links")
+            self.conn.execute("DELETE FROM devices")
+            self.conn.executemany(
+                "INSERT INTO devices (" + ",".join(fields) + ") VALUES (" + ",".join("?" for _ in fields) + ")",
+                [[str(row.get(field, "")).strip() for field in fields] for row in data["devices"]],
+            )
+            for link in data.get("links", []):
+                if not isinstance(link, dict):
+                    continue
+                source = self.conn.execute("SELECT id FROM devices WHERE ip_address=? ORDER BY id LIMIT 1", (str(link.get("source_ip", "")),)).fetchone()
+                target = self.conn.execute("SELECT id FROM devices WHERE ip_address=? ORDER BY id LIMIT 1", (str(link.get("target_ip", "")),)).fetchone()
+                if source and target and source["id"] != target["id"]:
+                    self.conn.execute("INSERT OR IGNORE INTO device_links(source_id,target_id,label) VALUES (?,?,?)", (source["id"], target["id"], str(link.get("label", "Connected"))))
+            categories = data.get("categories", {})
+            if isinstance(categories, dict):
+                for category in DEFAULTS:
+                    values = categories.get(category, [])
+                    if isinstance(values, list):
+                        self.conn.execute("DELETE FROM settings WHERE category=?", (category,))
+                        self.conn.executemany("INSERT OR IGNORE INTO settings(category,value) VALUES (?,?)", [(category, str(value).strip()) for value in values if str(value).strip()])
+        return len(data["devices"])
+class OptionManagerDialog(tk.Toplevel):
+    """Add, remove, and restore selectable values for a device field."""
+    def __init__(self, parent, db: InventoryDB, category: str, on_change=None):
+        super().__init__(parent)
+        self.db = db
+        self.category = category
+        self.on_change = on_change or (lambda: None)
+        self.title(f"Manage {category.replace('_', ' ')} options")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        box = ttk.Frame(self, padding=18)
+        box.pack(fill="both", expand=True)
+        ttk.Label(box, text=f"Manage {category.replace('_', ' ').title()} Options", style="Title.TLabel").pack(anchor="w")
+        self.listing = tk.Listbox(box, height=8, width=38, font=("Segoe UI", 10), exportselection=False)
+        self.listing.pack(fill="x", pady=(10, 8))
+        add_row = ttk.Frame(box)
+        add_row.pack(fill="x")
+        self.value = tk.StringVar()
+        entry = ttk.Entry(add_row, textvariable=self.value)
+        entry.pack(side="left", fill="x", expand=True)
+        entry.bind("<Return>", lambda _event: self.add_option())
+        ttk.Button(add_row, text="Add", style="Accent.TButton", command=self.add_option).pack(side="left", padx=(8, 0))
+        controls = ttk.Frame(box)
+        controls.pack(fill="x", pady=(8, 0))
+        ttk.Button(controls, text="Delete selected", command=self.remove_option).pack(side="left")
+        ttk.Button(controls, text="Restore defaults", command=self.restore_defaults).pack(side="right")
+        self.reload_list()
+
+    def reload_list(self):
+        self.listing.delete(0, "end")
+        for item in self.db.choices(self.category):
+            self.listing.insert("end", item)
+
+    def changed(self):
+        self.db.conn.commit()
+        self.reload_list()
+        self.on_change()
+
+    def add_option(self):
+        name = self.value.get().strip()
+        if not name:
+            return
+        if any(item.casefold() == name.casefold() for item in self.db.choices(self.category)):
+            messagebox.showinfo("Option already exists", "That option is already in the list.", parent=self)
+            return
+        self.db.add_choice(self.category, name)
+        self.value.set("")
+        self.changed()
+
+    def remove_option(self):
+        selection = self.listing.curselection()
+        if not selection:
+            return
+        name = self.listing.get(selection[0])
+        self.db.conn.execute("DELETE FROM settings WHERE category=? AND value=?", (self.category, name))
+        self.changed()
+
+    def restore_defaults(self):
+        defaults = DEFAULTS.get(self.category, [])
+        self.db.conn.execute("DELETE FROM settings WHERE category=?", (self.category,))
+        self.db.conn.executemany("INSERT INTO settings(category,value) VALUES (?,?)", [(self.category, value) for value in defaults])
+        self.changed()
+
+
+class DeviceDialog(tk.Toplevel):
+    def __init__(self, parent, db: InventoryDB, record=None):
+        super().__init__(parent)
+        self.db = db
+        self.result = None
+        self.title("Edit device" if record else "Add device")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        self.configure(bg=getattr(parent, "colors", {}).get("window", "#edf2fa"))
+        self.vars = {k: tk.StringVar(value=(record[k] if record else "")) for k in
+                     ("ip_address", "device_type", "hostname", "organization", "connection", "user_type")}
+        self.vars["connection"].set(record["connection"] if record else "Internal")
+        panel = ttk.Frame(self, padding=20)
+        panel.grid(sticky="nsew")
+        ttk.Label(panel, text="Device details", style="Title.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 14))
+        fields = [("IP address *", "ip_address", None), ("Device type", "device_type", "device_type"),
+                  ("Preferred hostname", "hostname", None), ("Organization", "organization", None),
+                  ("Connection", "connection", "connection"), ("User type", "user_type", "user_type")]
+        for i, (label, key, category) in enumerate(fields, 1):
+            ttk.Label(panel, text=label).grid(row=i, column=0, sticky="w", padx=(0, 12), pady=6)
+            if category:
+                cb = ttk.Combobox(panel, textvariable=self.vars[key], values=db.choices(category), width=30)
+                cb.grid(row=i, column=1, sticky="ew", pady=6)
+                if key in ("device_type", "user_type", "connection"):
+                    ttk.Button(panel, text="Manage", command=lambda c=category, combo=cb: self.manage_options(c, combo)).grid(row=i, column=2, padx=(6, 0))
+            else:
+                ttk.Entry(panel, textvariable=self.vars[key], width=34).grid(row=i, column=1, columnspan=2, sticky="ew", pady=6)
+        ttk.Label(panel, text="Notes").grid(row=7, column=0, sticky="nw", padx=(0, 12), pady=6)
+        self.notes = tk.Text(panel, width=36, height=4, wrap="word", font=("Segoe UI", 9), relief="solid", bd=1)
+        self.notes.grid(row=7, column=1, columnspan=2, sticky="ew", pady=6)
+        if record:
+            self.notes.insert("1.0", record["notes"])
+        buttons = ttk.Frame(panel)
+        buttons.grid(row=8, column=0, columnspan=3, sticky="e", pady=(14, 0))
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(buttons, text="Save device", style="Accent.TButton", command=self.save).pack(side="right")
+        self.bind("<Return>", lambda _e: self.save())
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.wait_visibility()
+        self.focus_set()
+
+    def manage_options(self, category, combo):
+        def refresh_options():
+            combo.configure(values=self.db.choices(category))
+            self.master.persist_active_file()
+        OptionManagerDialog(self, self.db, category, refresh_options)
+
+    def save(self):
+        values = {k: v.get().strip() for k, v in self.vars.items()}
+        values["notes"] = self.notes.get("1.0", "end-1c").strip()
+        if not values["ip_address"]:
+            messagebox.showerror("Required field", "Enter an IPv4 or IPv6 address.", parent=self)
+            return
+        try:
+            ipaddress.ip_address(values["ip_address"])
+        except ValueError:
+            messagebox.showerror("Invalid IP address", "Enter a valid IP address.", parent=self)
+            return
+        existing = self.db.conn.execute(
+            "SELECT id FROM devices WHERE lower(trim(ip_address))=lower(trim(?)) AND lower(trim(organization))=lower(trim(?)) AND id<>? LIMIT 1",
+            (values["ip_address"], values["organization"], getattr(self, "device_id", -1)),
+        ).fetchone()
+        if existing and not messagebox.askyesno(
+            "Possible duplicate device",
+            "This organization already has a device with this IP address. Add another entry anyway?",
+            parent=self,
+        ):
+            return
+        try:
+            self.device_id = self.db.save(values, getattr(self, "device_id", None))
+            self.result = True
+            self.destroy()
+        except sqlite3.Error as exc:
+            messagebox.showerror("Could not save", str(exc), parent=self)
+
+
+class LinkDialog(tk.Toplevel):
+    def __init__(self, parent, db, link=None):
+        super().__init__(parent)
+        self.db = db
+        self.link_id = link["id"] if link else None
+        self.result = False
+        self.title("Edit device connection" if link else "Add device connection")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        devices = list(db.conn.execute("SELECT id, ip_address, hostname, device_type FROM devices ORDER BY ip_address"))
+        self.labels = {
+            f"{r['hostname'] or r['device_type'] or 'Unnamed device'}  ·  {format_ip_address(r['ip_address'])}  [#{r['id']}]": r['id']
+            for r in devices
+        }
+        self.labels_by_id = {device_id: display for display, device_id in self.labels.items()}
+        box = ttk.Frame(self, padding=20)
+        box.pack(fill="both", expand=True)
+        title = "Edit device connection" if link else "Connect two registered devices"
+        ttk.Label(box, text=title, style="Title.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 14))
+        ttk.Label(box, text="Device 1").grid(row=1, column=0, sticky="w", pady=6)
+        ttk.Label(box, text="Device 2").grid(row=2, column=0, sticky="w", pady=6)
+        self.source = ttk.Combobox(box, values=list(self.labels), state="readonly", width=62)
+        self.target = ttk.Combobox(box, values=list(self.labels), state="readonly", width=62)
+        self.source.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=6)
+        self.target.grid(row=2, column=1, sticky="ew", padx=(12, 0), pady=6)
+        if devices:
+            self.source.current(0)
+        if len(devices) > 1:
+            self.target.current(1)
+        if link:
+            self.source.set(self.labels_by_id.get(link["source_id"], ""))
+            self.target.set(self.labels_by_id.get(link["target_id"], ""))
+        ttk.Label(box, text="Connection label").grid(row=3, column=0, sticky="w", pady=6)
+        self.label = tk.StringVar(value=link["label"] if link else "Connected")
+        ttk.Entry(box, textvariable=self.label, width=50).grid(row=3, column=1, sticky="ew", padx=(12, 0), pady=6)
+        actions = ttk.Frame(box)
+        actions.grid(row=4, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        ttk.Button(actions, text="Cancel", command=self.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(actions, text="Save changes" if link else "Save connection", style="Accent.TButton", command=self.save).pack(side="right")
+
+    def save(self):
+        source = self.labels.get(self.source.get())
+        target = self.labels.get(self.target.get())
+        label = self.label.get().strip() or "Connected"
+        if source is None or target is None:
+            messagebox.showerror("Choose devices", "Select two registered devices.", parent=self)
+            return
+        if source == target:
+            messagebox.showerror("Choose two devices", "A device cannot be connected to itself.", parent=self)
+            return
+        try:
+            if self.link_id is None:
+                self.db.conn.execute("INSERT OR IGNORE INTO device_links(source_id,target_id,label) VALUES (?,?,?)", (source, target, label))
+            else:
+                self.db.conn.execute("UPDATE device_links SET source_id=?, target_id=?, label=? WHERE id=?", (source, target, label, self.link_id))
+            self.db.conn.commit()
+            self.result = True
+            self.destroy()
+        except sqlite3.Error as exc:
+            messagebox.showerror("Could not save connection", str(exc), parent=self)
+
+class ConnectionTreeWindow(tk.Toplevel):
+    def __init__(self, parent, db):
+        super().__init__(parent)
+        self.db = db
+        self.title("Connection Tree")
+        self.geometry("1020x720")
+        self.minsize(760, 520)
+        self.transient(parent)
+        self.configure(bg=getattr(parent, "colors", {}).get("window", "#edf2fa"))
+        shell = ttk.Frame(self, padding=18)
+        shell.pack(fill="both", expand=True)
+        top = ttk.Frame(shell)
+        top.pack(fill="x", pady=(0, 10))
+        ttk.Label(top, text="Connection Tree", style="Title.TLabel").pack(side="left")
+        ttk.Button(top, text="+ Add connection", style="Accent.TButton", command=self.add_link).pack(side="right")
+        ttk.Label(shell, text="Visual map of the relationships you have recorded between devices.", style="Sub.TLabel").pack(anchor="w", pady=(0, 10))
+        chart = ttk.Frame(shell, style="Card.TFrame")
+        chart.pack(fill="both", expand=True, pady=(0, 10))
+        self.canvas = tk.Canvas(chart, bg="#ffffff", highlightthickness=0, height=400)
+        ybar = ttk.Scrollbar(chart, orient="vertical", command=self.canvas.yview)
+        xbar = ttk.Scrollbar(chart, orient="horizontal", command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        ybar.grid(row=0, column=1, sticky="ns")
+        xbar.grid(row=1, column=0, sticky="ew")
+        chart.rowconfigure(0, weight=1)
+        chart.columnconfigure(0, weight=1)
+        lower = ttk.Frame(shell, style="Card.TFrame", padding=10)
+        lower.pack(fill="x")
+        link_table = ttk.Frame(lower)
+        link_table.pack(side="left", fill="both", expand=True)
+        self.links = ttk.Treeview(link_table, columns=("source", "target", "label"), show="headings", height=5)
+        for key, caption, width in (("source", "Device 1 · Name / IP", 340), ("target", "Device 2 · Name / IP", 340), ("label", "Connection label", 180)):
+            self.links.heading(key, text=caption)
+            self.links.column(key, width=width, minwidth=150, anchor="w", stretch=False)
+        self.links.pack(fill="both", expand=True)
+        links_hbar = ttk.Scrollbar(link_table, orient="horizontal", command=self.links.xview)
+        self.links.configure(xscrollcommand=links_hbar.set)
+        links_hbar.pack(fill="x")
+        ttk.Button(lower, text="Remove selected", command=self.remove_link).pack(side="right", padx=(10, 0))
+        ttk.Button(lower, text="Edit selected", command=self.edit_link).pack(side="right", padx=(10, 0))
+        self.apply_theme()
+
+    def apply_theme(self):
+        dark = getattr(self.master, "theme_preference", tk.StringVar(value="Light")).get() == "Dark"
+        self.map_colors = ({
+            "background": "#0e1d34", "empty": "#a6b8d4", "link": "#789bd6",
+            "label": "#8fb5ff", "node": "#192f50", "outline": "#70a1ff",
+            "address": "#f0f5ff", "detail": "#b2c2dc",
+        } if dark else {
+            "background": "#ffffff", "empty": "#64748b", "link": "#7b9bdd",
+            "label": "#174ab2", "node": "#edf3ff", "outline": "#174ab2",
+            "address": "#14213d", "detail": "#52627a",
+        })
+        self.configure(bg=getattr(self.master, "colors", {}).get("window", "#edf2fa"))
+        self.canvas.configure(bg=self.map_colors["background"])
+        self.refresh()
+
+    def add_link(self):
+        devices = self.db.conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
+        if devices < 2:
+            messagebox.showinfo("Add more devices", "Register at least two devices before creating a connection.", parent=self)
+            return
+        dialog = LinkDialog(self, self.db)
+        self.wait_window(dialog)
+        if dialog.result:
+            self.refresh()
+            self.master.persist_active_file()
+            self.master.refresh_overview()
+
+    def edit_link(self):
+        selected = self.links.selection()
+        if not selected:
+            messagebox.showinfo("Select a connection", "Select a connection row first.", parent=self)
+            return
+        link = self.db.conn.execute("SELECT * FROM device_links WHERE id=?", (int(selected[0]),)).fetchone()
+        dialog = LinkDialog(self, self.db, link)
+        self.wait_window(dialog)
+        if dialog.result:
+            self.refresh()
+            self.master.persist_active_file()
+            self.master.refresh_overview()
+
+    def remove_link(self):
+        selected = self.links.selection()
+        if not selected:
+            messagebox.showinfo("Select a connection", "Select a connection row first.", parent=self)
+            return
+        self.db.conn.execute("DELETE FROM device_links WHERE id=?", (int(selected[0]),))
+        self.db.conn.commit()
+        self.refresh()
+        self.master.persist_active_file()
+        self.master.refresh_overview()
+
+    def refresh(self):
+        devices = list(self.db.conn.execute("SELECT id, ip_address, hostname, device_type, organization FROM devices ORDER BY organization COLLATE NOCASE, ip_address"))
+        links = list(self.db.conn.execute("SELECT l.id, l.source_id, l.target_id, l.label, a.ip_address AS source_ip, a.hostname AS source_host, b.ip_address AS target_ip, b.hostname AS target_host FROM device_links l JOIN devices a ON a.id=l.source_id JOIN devices b ON b.id=l.target_id ORDER BY l.id"))
+        self.links.delete(*self.links.get_children())
+        for link in links:
+            source_ip = format_ip_address(link["source_ip"])
+            target_ip = format_ip_address(link["target_ip"])
+            left = f"{link['source_host']}  ·  {source_ip}" if link["source_host"] else f"Unnamed device  ·  {source_ip}"
+            right = f"{link['target_host']}  ·  {target_ip}" if link["target_host"] else f"Unnamed device  ·  {target_ip}"
+            self.links.insert("", "end", iid=str(link["id"]), values=(left, right, link["label"]))
+        self.canvas.delete("all")
+        if not devices:
+            self.canvas.create_text(30, 35, anchor="nw", text="No devices yet. Add devices to start your connection map.", fill=self.map_colors["empty"], font=("Segoe UI", 11))
+            self.canvas.configure(scrollregion=(0, 0, 600, 180))
+            return
+        display_addresses = {device["id"]: format_ip_address(device["ip_address"]) for device in devices}
+        longest_address = max(len(value) for value in display_addresses.values())
+        node_width = max(190, min(360, longest_address * 8 + 42))
+        cols = 4
+        col_step = node_width + 65
+        row_step = 155
+        left_margin = 45
+        positions = {}
+        for index, device in enumerate(devices):
+            x = left_margin + node_width / 2 + (index % cols) * col_step
+            y = 95 + (index // cols) * row_step
+            positions[device["id"]] = (x, y)
+        column_count = min(cols, len(devices))
+        row_count = (len(devices) + cols - 1) // cols
+        width = int(left_margin * 2 + column_count * node_width + max(0, column_count - 1) * 65)
+        height = max(300, 145 + row_count * row_step)
+        for link in links:
+            x1, y1 = positions[link["source_id"]]
+            x2, y2 = positions[link["target_id"]]
+            self.canvas.create_line(x1, y1, x2, y2, fill=self.map_colors["link"], width=2, arrow="last")
+            self.canvas.create_text((x1+x2)/2, (y1+y2)/2 - 10, text=link["label"], fill=self.map_colors["label"], font=("Segoe UI", 8, "bold"), tags=("edge_label",))
+        for device in devices:
+            x, y = positions[device["id"]]
+            self.canvas.create_rectangle(x-node_width/2, y-40, x+node_width/2, y+40, fill=self.map_colors["node"], outline=self.map_colors["outline"], width=2)
+            self.canvas.create_text(x, y-10, text=display_addresses[device["id"]], fill=self.map_colors["address"], font=("Segoe UI", 10, "bold"), width=node_width-24, justify="center")
+            detail = device["hostname"] or device["device_type"] or "Device"
+            self.canvas.create_text(x, y+16, text=detail[:34], fill=self.map_colors["detail"], font=("Segoe UI", 8), width=node_width-24, justify="center")
+        self.canvas.configure(scrollregion=(0, 0, width, height))
+class AssetInventoryApp(tk.Tk):
+    COLUMNS = [("ip_address", "Host / IP", 150), ("device_type", "Device type", 125),
+               ("hostname", "Preferred hostname", 180), ("organization", "Organization", 155),
+               ("connection", "Connection", 110), ("user_type", "User type", 120)]
+
+    def __init__(self):
+        super().__init__()
+        self.db = InventoryDB()
+        self.active_inventory_file = None
+        self.dirty = False
+        self.title("Asset Inventory")
+        self.geometry("1240x760")
+        self.minsize(960, 600)
+        self.configure(bg="#0a1428")
+        self.selected_id = None
+        self.theme_preference = tk.StringVar(value="Light")
+        self.font_preference = tk.StringVar(value="Medium")
+        self._style()
+        self._layout()
+        self.refresh()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.deiconify()
+
+    def has_unsaved_entries(self):
+        # Without an active file, only a non-default in-memory inventory is unsaved work.
+        # This clears naturally after users undo their changes (for example, add then delete).
+        device_count = self.db.conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
+        link_count = self.db.conn.execute("SELECT COUNT(*) FROM device_links").fetchone()[0]
+        if device_count or link_count:
+            return True
+        return any(set(self.db.choices(category)) != set(defaults)
+                   for category, defaults in DEFAULTS.items())
+
+    def persist_active_file(self):
+        if not self.active_inventory_file:
+            self.dirty = self.has_unsaved_entries()
+            return
+        try:
+            self.db.export_file(self.active_inventory_file)
+            self.dirty = False
+        except OSError as exc:
+            self.dirty = True
+            messagebox.showerror("Could not save inventory file", str(exc), parent=self)
+
+    def _remember_active_file(self):
+        # File selection is deliberately session-only. The user chooses a file again through Import, Export, or Change file.
+        self.dirty = False
+
+    def on_close(self):
+        if not self.dirty:
+            self.destroy()
+            return
+        if self.active_inventory_file:
+            prompt = "Changes could not be saved to the selected file. Are you sure you want to quit?"
+        else:
+            prompt = "Your progress has not been saved to a file. Are you sure you want to quit? Choose No to return and export your work."
+        if messagebox.askyesno("Unsaved progress", prompt, parent=self):
+            self.destroy()
+    def report_callback_exception(self, exc_type, exc_value, exc_traceback):
+        messagebox.showerror(
+            "Unexpected app error",
+            f"Something went wrong. Please review your inventory and save a copy if needed.\\n\\nDetails: {exc_value}",
+            parent=self,
+        )
+    def change_inventory_file(self):
+        current = self.active_inventory_file
+        chosen = filedialog.asksaveasfilename(parent=self, title="Choose inventory file", defaultextension=".json", filetypes=[("Asset Inventory JSON", "*.json")], initialdir=str(current.parent) if current else str(Path.home()), initialfile=current.name if current else "asset-inventory.json")
+        if not chosen:
+            return
+        path = Path(chosen)
+        try:
+            if path.resolve() != current.resolve() if current else True:
+                if path.exists():
+                    if not messagebox.askyesno("Load another inventory?", "This file will replace the inventory currently open in the app. Continue?", parent=self):
+                        return
+                    self.db.import_file(path)
+                else:
+                    self.db.export_file(path)
+            self.active_inventory_file = path
+            self._remember_active_file()
+            self.clear_filters()
+            self.refresh()
+        except (OSError, json.JSONDecodeError, ValueError, sqlite3.Error) as exc:
+            messagebox.showerror("Could not change inventory file", str(exc), parent=self)
+
+    def _style(self):
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        dark = self.theme_preference.get() == "Dark"
+        if dark:
+            self.colors = {
+                "window": "#0a1428", "header": "#10264b", "surface": "#132440",
+                "card": "#132440", "text": "#d6e2f5", "muted": "#94a8c8",
+                "title": "#f5f8ff", "accent": "#70a1ff", "nav": "#1a3154",
+                "nav_text": "#b9c9e2", "table": "#0e1d34", "table_head": "#1b3153",
+                "table_text": "#e2ebf8", "selected": "#244b83",
+            }
+        else:
+            self.colors = {
+                "window": "#edf2fa", "header": "#174ab2", "surface": "#ffffff",
+                "card": "#ffffff", "text": "#334155", "muted": "#64748b",
+                "title": "#14213d", "accent": "#174ab2", "nav": "#dce7f8",
+                "nav_text": "#355174", "table": "#ffffff", "table_head": "#e8effb",
+                "table_text": "#1d2d46", "selected": "#d9e6ff",
+            }
+        c = self.colors
+        medium = {"Small": 8, "Medium": 9, "Large": 11}[self.font_preference.get()]
+        small = max(7, medium - 1)
+        large = medium + 2
+        row_height = 38
+        self.configure(bg=c["window"])
+        style.configure("TFrame", background=c["window"])
+        style.configure("Header.TFrame", background=c["header"])
+        style.configure("Card.TFrame", background=c["card"])
+        style.configure("Metric.TFrame", background=c["surface"])
+        style.configure("MetricTitle.TLabel", background=c["surface"], foreground=c["muted"], font=("Segoe UI", small, "bold"))
+        style.configure("MetricValue.TLabel", background=c["surface"], foreground=c["accent"], font=("Segoe UI", large + 14, "bold"))
+        style.configure("TLabel", background=c["window"], foreground=c["text"], font=("Segoe UI", medium))
+        style.configure("HeaderTitle.TLabel", background=c["header"], foreground="white", font=("Segoe UI", large + 11, "bold"))
+        style.configure("HeaderSub.TLabel", background=c["header"], foreground="#b9ccef" if dark else "#dce7ff", font=("Segoe UI", small))
+        style.configure("HeaderLink.TLabel", background=c["header"], foreground="#ffffff", font=("Segoe UI", small, "underline"))
+        style.configure("Eyebrow.TLabel", background=c["header"], foreground="#7ca9ff" if dark else "#c2d7ff", font=("Segoe UI", max(7, small - 1), "bold"))
+        style.configure("Title.TLabel", background=c["window"], font=("Segoe UI", large + 10, "bold"), foreground=c["title"])
+        style.configure("Sub.TLabel", background=c["window"], font=("Segoe UI", small), foreground=c["muted"])
+        style.configure("CardTitle.TLabel", background=c["card"], foreground=c["title"], font=("Segoe UI", medium + 3, "bold"))
+        style.configure("ToolbarTitle.TLabel", background=c["window"], foreground=c["title"], font=("Segoe UI", medium + 5, "bold"))
+        style.configure("TButton", font=("Segoe UI", medium), padding=(10, 7), background=c["nav"], foreground=c["nav_text"], borderwidth=0)
+        style.map("TButton", background=[("active", c["accent"])], foreground=[("active", "white")])
+        style.configure("Nav.TButton", font=("Segoe UI", medium, "bold"), padding=(14, 8), background=c["nav"], foreground=c["nav_text"], borderwidth=0)
+        style.map("Nav.TButton", background=[("active", c["accent"])], foreground=[("active", "white")])
+        style.configure("NavActive.TButton", font=("Segoe UI", medium, "bold"), padding=(14, 8), background=c["accent"], foreground="white", borderwidth=0)
+        style.map("NavActive.TButton", background=[("active", c["accent"])])
+        style.configure("Accent.TButton", background=c["accent"], foreground="white", font=("Segoe UI", medium, "bold"), padding=(12, 8), borderwidth=0)
+        style.map("Accent.TButton", background=[("active", "#3978ed" if dark else "#103b96")])
+        style.configure("Treeview", background=c["table"], fieldbackground=c["table"], foreground=c["table_text"], rowheight=row_height, font=("Segoe UI", medium), borderwidth=0)
+        style.configure("Treeview.Heading", background=c["table_head"], foreground=c["nav_text"] if dark else "#334b70", font=("Segoe UI", small, "bold"), padding=10)
+        style.map("Treeview", background=[("selected", c["selected"])], foreground=[("selected", "white" if dark else "#1e3a8a")])
+        style.configure("FilterLabel.TLabel", background=c["card"], foreground=c["muted"], font=("Segoe UI", small))
+        style.configure("FilterEyebrow.TLabel", background=c["card"], foreground=c["muted"], font=("Segoe UI", max(7, small - 1), "bold"))
+        style.configure("PreferencePageTitle.TLabel", background=c["card"], foreground=c["title"], font=("Segoe UI", large + 7, "bold"))
+        style.configure("PreferenceTitle.TLabel", background=c["card"], foreground=c["title"], font=("Segoe UI", medium + 2, "bold"))
+        style.configure("PreferenceText.TLabel", background=c["card"], foreground=c["muted"], font=("Segoe UI", small))
+        style.configure("TRadiobutton", background=c["card"], foreground=c["text"], font=("Segoe UI", medium))
+        style.map("TRadiobutton", background=[("active", c["card"])], foreground=[("active", c["accent"])])
+
+    def apply_preferences(self):
+        self._style()
+        if hasattr(self, "filter_vars"):
+            self.status.configure(font=("Segoe UI", {"Small": 8, "Medium": 9, "Large": 11}[self.font_preference.get()]))
+        tree_window = getattr(self, "connection_tree_window", None)
+        if tree_window and tree_window.winfo_exists():
+            tree_window.apply_theme()
+        self.refresh()
+
+    def _layout(self):
+        shell = ttk.Frame(self, padding=(22, 18, 22, 18))
+        shell.pack(fill="both", expand=True)
+        header = ttk.Frame(shell, style="Header.TFrame", padding=(22, 18))
+        header.pack(fill="x", pady=(0, 16))
+        header_left = ttk.Frame(header, style="Header.TFrame")
+        header_left.pack(side="left", fill="x", expand=True)
+        ttk.Label(header_left, text="SOC  /  ASSET REGISTER", style="Eyebrow.TLabel").pack(anchor="w", pady=(0, 5))
+        ttk.Label(header_left, text="Asset Inventory", style="HeaderTitle.TLabel").pack(anchor="w")
+        ttk.Label(header_left, text="A clear view of your hosts, ownership, and network exposure.", style="HeaderSub.TLabel").pack(anchor="w", pady=(4, 0))
+        header_right = ttk.Frame(header, style="Header.TFrame")
+        header_right.pack(side="right", anchor="ne", padx=(16, 0))
+        github_link = ttk.Label(header_right, text="https://github.com/IEnduranceI", style="HeaderLink.TLabel", cursor="hand2")
+        github_link.pack(anchor="e")
+        github_link.bind("<Button-1>", self.open_github_profile)
+        self.stats = ttk.Label(header_right, text="", style="HeaderSub.TLabel")
+        self.stats.pack(anchor="e", pady=(10, 0))
+        nav = ttk.Frame(shell)
+        nav.pack(fill="x", pady=(0, 14))
+        self.section = tk.StringVar(value="home")
+        self.nav_buttons = {}
+        for name, caption in (("home", "Home"), ("overview", "Overview")):
+            button = ttk.Button(nav, text=caption, style="NavActive.TButton" if name == "home" else "Nav.TButton", command=lambda n=name: self.show_section(n))
+            button.pack(side="left", padx=(0, 8))
+            self.nav_buttons[name] = button
+        ttk.Button(nav, text="Connection tree", style="Nav.TButton", command=self.open_connection_tree).pack(side="left", padx=(0, 8))
+        preferences_button = ttk.Button(nav, text="Preferences", style="Nav.TButton", command=lambda: self.show_section("preferences"))
+        preferences_button.pack(side="left", padx=(0, 8))
+        self.nav_buttons["preferences"] = preferences_button
+
+        self.home_panel = ttk.Frame(shell)
+        self.home_panel.pack(fill="both", expand=True)
+        self.overview_panel = ttk.Frame(shell)
+        self.preferences_panel = ttk.Frame(shell)
+
+        metrics = ttk.Frame(self.overview_panel)
+        metrics.pack(fill="x", pady=(0, 16))
+        self.overview_count_vars = {
+            "hosts": tk.StringVar(value="0"),
+            "links": tk.StringVar(value="0"),
+            "types": tk.StringVar(value="0"),
+        }
+        for index, (key, title) in enumerate((("hosts", "Hosts"), ("links", "Device connections"), ("types", "Device types"))):
+            card = ttk.Frame(metrics, style="Metric.TFrame", padding=(18, 15))
+            card.grid(row=0, column=index, sticky="nsew", padx=(0 if index == 0 else 8, 8 if index < 2 else 0))
+            ttk.Label(card, text=title, style="MetricTitle.TLabel").pack(anchor="w")
+            ttk.Label(card, textvariable=self.overview_count_vars[key], style="MetricValue.TLabel").pack(anchor="w", pady=(6, 0))
+            metrics.columnconfigure(index, weight=1)
+
+        breakdown = ttk.Frame(self.overview_panel)
+        breakdown.pack(fill="both", expand=True)
+        type_card = ttk.Frame(breakdown, style="Card.TFrame", padding=14)
+        type_card.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        ttk.Label(type_card, text="Hosts by device type", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 10))
+        self.type_summary = ttk.Treeview(type_card, columns=("type", "count"), show="headings", height=14)
+        self.type_summary.heading("type", text="Device type")
+        self.type_summary.heading("count", text="Hosts")
+        self.type_summary.column("type", width=220, anchor="w")
+        self.type_summary.column("count", width=90, anchor="center")
+        self.type_summary.pack(fill="both", expand=True)
+
+        connection_card = ttk.Frame(breakdown, style="Card.TFrame", padding=14)
+        connection_card.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        ttk.Label(connection_card, text="Hosts by connection type", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 10))
+        self.connection_summary = ttk.Treeview(connection_card, columns=("connection", "count"), show="headings", height=14)
+        self.connection_summary.heading("connection", text="Connection type")
+        self.connection_summary.heading("count", text="Hosts")
+        self.connection_summary.column("connection", width=220, anchor="w")
+        self.connection_summary.column("count", width=90, anchor="center")
+        self.connection_summary.pack(fill="both", expand=True)
+
+        filters = ttk.Frame(self.home_panel, style="Card.TFrame", padding=14)
+        filters.pack(fill="x", pady=(0, 14))
+        ttk.Label(filters, text="FILTER DEVICES", style="FilterEyebrow.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=(0, 9))
+        self.filter_vars = {k: tk.StringVar() for k in ("ip_address", "device_type", "hostname", "organization", "connection", "user_type")}
+        labels = [("Host / IP", "ip_address"), ("Device type", "device_type"), ("Hostname", "hostname"), ("Organization", "organization"), ("Connection", "connection"), ("User type", "user_type")]
+        for col, (label, key) in enumerate(labels):
+            ttk.Label(filters, text=label, style="FilterLabel.TLabel").grid(row=1, column=col, sticky="w", padx=(0, 8))
+            entry = ttk.Entry(filters, textvariable=self.filter_vars[key], width=18)
+            entry.grid(row=2, column=col, sticky="ew", padx=(0, 8), pady=(4, 0))
+            entry.bind("<KeyRelease>", lambda _e: self.refresh())
+            filters.columnconfigure(col, weight=1)
+        ttk.Button(filters, text="Clear filters", command=self.clear_filters).grid(row=2, column=6, padx=(5, 0))
+
+        toolbar = ttk.Frame(self.home_panel)
+        toolbar.pack(fill="x", pady=(0, 10))
+        ttk.Label(toolbar, text="Device inventory", style="ToolbarTitle.TLabel").pack(side="left")
+        ttk.Button(toolbar, text="Export", command=self.export_inventory).pack(side="left", padx=(14, 0))
+        ttk.Button(toolbar, text="Import", command=self.import_inventory).pack(side="left", padx=(8, 0))
+        ttk.Button(toolbar, text="Change file", command=self.change_inventory_file).pack(side="left", padx=(8, 0))
+        ttk.Button(toolbar, text="Delete", command=self.delete_selected).pack(side="right", padx=(8, 0))
+        ttk.Button(toolbar, text="Edit selected", command=self.edit_selected).pack(side="right", padx=(8, 0))
+        ttk.Button(toolbar, text="+ Add device", style="Accent.TButton", command=self.add_device).pack(side="right")
+
+        tablewrap = ttk.Frame(self.home_panel, style="Card.TFrame", padding=1)
+        tablewrap.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(tablewrap, columns=[c[0] for c in self.COLUMNS], show="headings", selectmode="browse")
+        for key, title, width in self.COLUMNS:
+            self.tree.heading(key, text=title, command=lambda k=key: self.sort_by(k))
+            self.tree.column(key, width=width, minwidth=85, anchor="w")
+        vsb = ttk.Scrollbar(tablewrap, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(tablewrap, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        tablewrap.rowconfigure(0, weight=1)
+        tablewrap.columnconfigure(0, weight=1)
+        self.tree.bind("<Double-1>", lambda _e: self.edit_selected())
+        self.tree.bind("<<TreeviewSelect>>", self.on_select)
+        self.status = ttk.Label(self.home_panel, text="", style="Sub.TLabel")
+        self.status.pack(anchor="w", pady=(9, 0))
+
+        settings_card = ttk.Frame(self.preferences_panel, style="Card.TFrame", padding=24)
+        settings_card.pack(fill="x", anchor="n")
+        ttk.Label(settings_card, text="Personalize your workspace", style="PreferencePageTitle.TLabel").pack(anchor="w")
+        ttk.Label(settings_card, text="Tune the inventory view for your workspace. Changes apply immediately.", style="Sub.TLabel").pack(anchor="w", pady=(4, 20))
+
+        ttk.Label(settings_card, text="Appearance", style="PreferenceTitle.TLabel").pack(anchor="w")
+        ttk.Label(settings_card, text="Choose a light or dark SOC workspace.", style="PreferenceText.TLabel").pack(anchor="w", pady=(3, 8))
+        theme_row = ttk.Frame(settings_card, style="Card.TFrame")
+        theme_row.pack(anchor="w", pady=(0, 18))
+        for theme_name in ("Dark", "Light"):
+            ttk.Radiobutton(theme_row, text=theme_name, value=theme_name, variable=self.theme_preference, command=self.apply_preferences).pack(side="left", padx=(0, 18))
+
+        ttk.Label(settings_card, text="Text size", style="PreferenceTitle.TLabel").pack(anchor="w")
+        ttk.Label(settings_card, text="Adjust labels and table text for readability.", style="PreferenceText.TLabel").pack(anchor="w", pady=(3, 8))
+        font_row = ttk.Frame(settings_card, style="Card.TFrame")
+        font_row.pack(anchor="w", pady=(0, 18))
+        for size_name in ("Small", "Medium", "Large"):
+            ttk.Radiobutton(font_row, text=size_name, value=size_name, variable=self.font_preference, command=self.apply_preferences).pack(side="left", padx=(0, 18))
+
+        ttk.Label(settings_card, text="These display preferences last for this session. Inventory data is saved only to the file you choose.", style="PreferenceText.TLabel", wraplength=760).pack(anchor="w", pady=(4, 0))
+
+    def export_inventory(self):
+        current = self.active_inventory_file
+        chosen = filedialog.asksaveasfilename(parent=self, title="Export inventory", defaultextension=".json", filetypes=[("Asset Inventory JSON", "*.json")], initialdir=str(current.parent) if current else str(Path.home()), initialfile=current.name if current else "asset-inventory.json")
+        if not chosen:
+            return
+        path = Path(chosen)
+        try:
+            self.db.export_file(path)
+            self.active_inventory_file = path
+            self._remember_active_file()
+            self.clear_filters()
+            self.refresh()
+            messagebox.showinfo("Export complete", f"Inventory saved to:\\n{path}", parent=self)
+        except OSError as exc:
+            messagebox.showerror("Export failed", str(exc), parent=self)
+
+    def import_inventory(self):
+        current = self.active_inventory_file
+        chosen = filedialog.askopenfilename(parent=self, title="Import inventory", filetypes=[("Asset Inventory JSON", "*.json"), ("All files", "*.*")], initialdir=str(current.parent) if current else str(Path.home()), initialfile=current.name if current else "")
+        if not chosen:
+            return
+        path = Path(chosen)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or data.get("format") != "asset-inventory" or not isinstance(data.get("devices"), list):
+                raise ValueError("This file is not a supported Asset Inventory file.")
+            count = len(data["devices"])
+            if not messagebox.askyesno("Replace current inventory?", f"Import {count} devices and replace the current inventory? This cannot be undone.", parent=self):
+                return
+            self.db.import_file(path)
+            self.active_inventory_file = path
+            self._remember_active_file()
+            self.clear_filters()
+            self.refresh()
+            messagebox.showinfo("Import complete", f"Imported {count} devices from:\\n{path}", parent=self)
+        except (OSError, json.JSONDecodeError, ValueError, sqlite3.Error) as exc:
+            messagebox.showerror("Import failed", str(exc), parent=self)
+    def open_github_profile(self, _event=None):
+        webbrowser.open_new_tab("https://github.com/IEnduranceI")
+
+    def open_connection_tree(self):
+        existing = getattr(self, "connection_tree_window", None)
+        if existing and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            return
+        self.connection_tree_window = ConnectionTreeWindow(self, self.db)
+
+    def manage_connections(self):
+        OptionManagerDialog(self, self.db, "connection", self.persist_active_file)
+    def show_section(self, section):
+        self.section.set(section)
+        for name, button in getattr(self, "nav_buttons", {}).items():
+            button.configure(style="NavActive.TButton" if name == section else "Nav.TButton")
+        self.home_panel.pack_forget()
+        self.overview_panel.pack_forget()
+        self.preferences_panel.pack_forget()
+        if section == "overview":
+            self.overview_panel.pack(fill="both", expand=True)
+            self.refresh_overview()
+        elif section == "preferences":
+            self.preferences_panel.pack(fill="both", expand=True)
+        else:
+            self.home_panel.pack(fill="both", expand=True)
+
+    def add_device(self):
+        dlg = DeviceDialog(self, self.db)
+        self.wait_window(dlg)
+        if dlg.result:
+            self.clear_filters()
+            self.refresh()
+            self.persist_active_file()
+            device_iid = str(dlg.device_id)
+            self.tree.selection_set(device_iid)
+            self.tree.focus(device_iid)
+            self.tree.see(device_iid)
+
+    def _selected_record(self):
+        chosen = self.tree.selection()
+        return int(chosen[0]) if chosen else None
+
+    def edit_selected(self):
+        device_id = self._selected_record()
+        if device_id is None:
+            messagebox.showinfo("Select a device", "Select a device row first.", parent=self)
+            return
+        record = self.db.conn.execute("SELECT * FROM devices WHERE id=?", (device_id,)).fetchone()
+        dlg = DeviceDialog(self, self.db, record)
+        dlg.device_id = device_id
+        self.wait_window(dlg)
+        if dlg.result:
+            self.clear_filters()
+            self.refresh()
+            self.persist_active_file()
+            self.tree.selection_set(str(device_id))
+            self.tree.focus(str(device_id))
+            self.tree.see(str(device_id))
+
+    def delete_selected(self):
+        device_id = self._selected_record()
+        if device_id is None:
+            messagebox.showinfo("Select a device", "Select a device row first.", parent=self)
+            return
+        if messagebox.askyesno("Delete device", "Delete this device from the inventory? This cannot be undone.", parent=self):
+            self.db.delete(device_id)
+            self.refresh()
+            self.persist_active_file()
+
+    def on_select(self, _event=None):
+        self.selected_id = self._selected_record()
+
+    def filters(self):
+        return {key: var.get().strip() for key, var in self.filter_vars.items()}
+
+    def clear_filters(self):
+        for var in self.filter_vars.values():
+            var.set("")
+        self.refresh()
+
+    def refresh(self):
+        rows = self.db.rows(self.filters())
+        self.tree.delete(*self.tree.get_children())
+        max_ip_length = max((len(format_ip_address(row["ip_address"])) for row in rows), default=0)
+        self.tree.column("ip_address", width=max(150, min(360, max_ip_length * 9 + 28)))
+        for row in rows:
+            values = [format_ip_address(row["ip_address"]) if column[0] == "ip_address" else row[column[0]] for column in self.COLUMNS]
+            self.tree.insert("", "end", iid=str(row["id"]), values=values)
+        total = self.db.conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
+        self.stats.configure(text=f"{total} device{'s' if total != 1 else ''} in inventory")
+        self.status.configure(text=f"Showing {len(rows)} of {total} devices  ·  Filters combine to narrow results")
+        self.refresh_overview()
+
+    def refresh_overview(self):
+        if not hasattr(self, "overview_count_vars"):
+            return
+        host_count = self.db.conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
+        link_count = self.db.conn.execute("SELECT COUNT(*) FROM device_links l JOIN devices a ON a.id=l.source_id JOIN devices b ON b.id=l.target_id").fetchone()[0]
+        type_count = self.db.conn.execute("SELECT COUNT(DISTINCT COALESCE(NULLIF(TRIM(device_type), ''), 'Unspecified')) FROM devices").fetchone()[0]
+        self.overview_count_vars["hosts"].set(str(host_count))
+        self.overview_count_vars["links"].set(str(link_count))
+        self.overview_count_vars["types"].set(str(type_count))
+        self.type_summary.delete(*self.type_summary.get_children())
+        for row in self.db.conn.execute("SELECT COALESCE(NULLIF(TRIM(device_type), ''), 'Unspecified') AS label, COUNT(*) AS total FROM devices GROUP BY label ORDER BY label COLLATE NOCASE"):
+            self.type_summary.insert("", "end", values=(row["label"], row["total"]))
+        self.connection_summary.delete(*self.connection_summary.get_children())
+        for row in self.db.conn.execute("SELECT COALESCE(NULLIF(TRIM(connection), ''), 'Unspecified') AS label, COUNT(*) AS total FROM devices GROUP BY label ORDER BY label COLLATE NOCASE"):
+            self.connection_summary.insert("", "end", values=(row["label"], row["total"]))
+    def sort_by(self, key):
+        items = [(self.tree.set(i, key).casefold(), i) for i in self.tree.get_children("")]
+        reverse = getattr(self, "_sort_reverse", {}).get(key, False)
+        items.sort(reverse=reverse)
+        for index, (_, iid) in enumerate(items):
+            self.tree.move(iid, "", index)
+        self._sort_reverse = getattr(self, "_sort_reverse", {})
+        self._sort_reverse[key] = not reverse
+
+
+if __name__ == "__main__":
+    # simpledialog is imported explicitly for the custom-option shortcut.
+    from tkinter import simpledialog
+    app = AssetInventoryApp()
+    app.mainloop()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
