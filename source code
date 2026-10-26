@@ -8,10 +8,23 @@ from __future__ import annotations
 import ipaddress
 import json
 import sqlite3
-import webbrowser
+import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
+
+
+def resource_path(filename: str) -> Path:
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / filename
+
+
+def apply_app_icon(window) -> None:
+    """Apply the bundled Asset Inventory icon to this top-level window."""
+    try:
+        window.iconbitmap(str(resource_path("asset_inventory.ico")))
+    except (tk.TclError, OSError):
+        pass
 
 def format_ip_address(value: str) -> str:
     try:
@@ -147,6 +160,7 @@ class OptionManagerDialog(tk.Toplevel):
     """Add, remove, and restore selectable values for a device field."""
     def __init__(self, parent, db: InventoryDB, category: str, on_change=None):
         super().__init__(parent)
+        apply_app_icon(self)
         self.db = db
         self.category = category
         self.on_change = on_change or (lambda: None)
@@ -211,6 +225,7 @@ class OptionManagerDialog(tk.Toplevel):
 class DeviceDialog(tk.Toplevel):
     def __init__(self, parent, db: InventoryDB, record=None):
         super().__init__(parent)
+        apply_app_icon(self)
         self.db = db
         self.result = None
         self.title("Edit device" if record else "Add device")
@@ -288,6 +303,7 @@ class DeviceDialog(tk.Toplevel):
 class LinkDialog(tk.Toplevel):
     def __init__(self, parent, db, link=None):
         super().__init__(parent)
+        apply_app_icon(self)
         self.db = db
         self.link_id = link["id"] if link else None
         self.result = False
@@ -295,9 +311,9 @@ class LinkDialog(tk.Toplevel):
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
-        devices = list(db.conn.execute("SELECT id, ip_address, hostname, device_type FROM devices ORDER BY ip_address"))
+        devices = list(db.conn.execute("SELECT id, ip_address, hostname, device_type, organization FROM devices ORDER BY organization COLLATE NOCASE, ip_address"))
         self.labels = {
-            f"{r['hostname'] or r['device_type'] or 'Unnamed device'}  ·  {format_ip_address(r['ip_address'])}  [#{r['id']}]": r['id']
+            f"{r['organization'].strip() or 'Unassigned'}  ·  {r['hostname'] or r['device_type'] or 'Unnamed device'}  ·  {format_ip_address(r['ip_address'])}  [#{r['id']}]": r['id']
             for r in devices
         }
         self.labels_by_id = {device_id: display for display, device_id in self.labels.items()}
@@ -318,11 +334,12 @@ class LinkDialog(tk.Toplevel):
         if link:
             self.source.set(self.labels_by_id.get(link["source_id"], ""))
             self.target.set(self.labels_by_id.get(link["target_id"], ""))
-        ttk.Label(box, text="Connection label").grid(row=3, column=0, sticky="w", pady=6)
+        ttk.Label(box, text="Endpoints may belong to different organizations.", style="Sub.TLabel").grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 6))
+        ttk.Label(box, text="Connection label").grid(row=4, column=0, sticky="w", pady=6)
         self.label = tk.StringVar(value=link["label"] if link else "Connected")
-        ttk.Entry(box, textvariable=self.label, width=50).grid(row=3, column=1, sticky="ew", padx=(12, 0), pady=6)
+        ttk.Entry(box, textvariable=self.label, width=50).grid(row=4, column=1, sticky="ew", padx=(12, 0), pady=6)
         actions = ttk.Frame(box)
-        actions.grid(row=4, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        actions.grid(row=5, column=0, columnspan=2, sticky="e", pady=(14, 0))
         ttk.Button(actions, text="Cancel", command=self.destroy).pack(side="right", padx=(8, 0))
         ttk.Button(actions, text="Save changes" if link else "Save connection", style="Accent.TButton", command=self.save).pack(side="right")
 
@@ -350,6 +367,7 @@ class LinkDialog(tk.Toplevel):
 class ConnectionTreeWindow(tk.Toplevel):
     def __init__(self, parent, db):
         super().__init__(parent)
+        apply_app_icon(self)
         self.db = db
         self.title("Connection Tree")
         self.geometry("1020x720")
@@ -361,8 +379,20 @@ class ConnectionTreeWindow(tk.Toplevel):
         top = ttk.Frame(shell)
         top.pack(fill="x", pady=(0, 10))
         ttk.Label(top, text="Connection Tree", style="Title.TLabel").pack(side="left")
+        ttk.Button(top, text="Remove selected", command=self.remove_link).pack(side="right", padx=(8, 0))
+        ttk.Button(top, text="Edit selected", command=self.edit_link).pack(side="right", padx=(8, 0))
         ttk.Button(top, text="+ Add connection", style="Accent.TButton", command=self.add_link).pack(side="right")
-        ttk.Label(shell, text="Visual map of the relationships you have recorded between devices.", style="Sub.TLabel").pack(anchor="w", pady=(0, 10))
+        ttk.Label(shell, text="Only saved direct connections are drawn. With partner organizations included, only links involving the selected organization appear.", style="Sub.TLabel").pack(anchor="w", pady=(0, 8))
+        filter_row = ttk.Frame(shell)
+        filter_row.pack(fill="x", pady=(0, 10))
+        ttk.Label(filter_row, text="Organization", style="FilterLabel.TLabel").pack(side="left", padx=(0, 8))
+        self.organization_filter = tk.StringVar(value="All organizations")
+        self.organization_combo = ttk.Combobox(filter_row, textvariable=self.organization_filter, state="readonly", width=30)
+        self.organization_combo.pack(side="left")
+        self.organization_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh())
+        self.include_partner_orgs = tk.BooleanVar(value=False)
+        ttk.Checkbutton(filter_row, text="Include partner organizations and show their direct links to this one", variable=self.include_partner_orgs, style="OrgFilter.TCheckbutton", command=self.refresh).pack(side="left", padx=(14, 0))
+
         chart = ttk.Frame(shell, style="Card.TFrame")
         chart.pack(fill="both", expand=True, pady=(0, 10))
         self.canvas = tk.Canvas(chart, bg="#ffffff", highlightthickness=0, height=400)
@@ -386,9 +416,29 @@ class ConnectionTreeWindow(tk.Toplevel):
         links_hbar = ttk.Scrollbar(link_table, orient="horizontal", command=self.links.xview)
         self.links.configure(xscrollcommand=links_hbar.set)
         links_hbar.pack(fill="x")
-        ttk.Button(lower, text="Remove selected", command=self.remove_link).pack(side="right", padx=(10, 0))
-        ttk.Button(lower, text="Edit selected", command=self.edit_link).pack(side="right", padx=(10, 0))
+        self._update_organization_filter()
         self.apply_theme()
+
+    def _update_organization_filter(self):
+        rows = self.db.conn.execute("SELECT organization FROM devices ORDER BY organization COLLATE NOCASE").fetchall()
+        organizations = []
+        seen = set()
+        has_unassigned = False
+        for row in rows:
+            name = (row["organization"] or "").strip()
+            if not name:
+                has_unassigned = True
+            elif name.casefold() not in seen:
+                organizations.append(name)
+                seen.add(name.casefold())
+        values = ["All organizations"]
+        if has_unassigned:
+            values.append("Unassigned")
+        values.extend(organizations)
+        current = self.organization_filter.get()
+        self.organization_combo.configure(values=values)
+        if current not in values:
+            self.organization_filter.set("All organizations")
 
     def apply_theme(self):
         dark = getattr(self.master, "theme_preference", tk.StringVar(value="Light")).get() == "Dark"
@@ -442,48 +492,107 @@ class ConnectionTreeWindow(tk.Toplevel):
         self.master.refresh_overview()
 
     def refresh(self):
-        devices = list(self.db.conn.execute("SELECT id, ip_address, hostname, device_type, organization FROM devices ORDER BY organization COLLATE NOCASE, ip_address"))
-        links = list(self.db.conn.execute("SELECT l.id, l.source_id, l.target_id, l.label, a.ip_address AS source_ip, a.hostname AS source_host, b.ip_address AS target_ip, b.hostname AS target_host FROM device_links l JOIN devices a ON a.id=l.source_id JOIN devices b ON b.id=l.target_id ORDER BY l.id"))
+        self._update_organization_filter()
+        all_devices = list(self.db.conn.execute("SELECT id, ip_address, hostname, device_type, organization FROM devices ORDER BY organization COLLATE NOCASE, ip_address"))
+        # Lines are sourced only from explicitly saved device_links records. Organizations
+        # and filter membership never create inferred or all-to-all connections.
+        all_links = list(self.db.conn.execute("SELECT l.id, l.source_id, l.target_id, l.label, a.ip_address AS source_ip, a.hostname AS source_host, a.organization AS source_org, b.ip_address AS target_ip, b.hostname AS target_host, b.organization AS target_org FROM device_links l JOIN devices a ON a.id=l.source_id JOIN devices b ON b.id=l.target_id ORDER BY l.id"))
+        selected_org = self.organization_filter.get()
+        if selected_org == "All organizations":
+            visible_devices = all_devices
+        else:
+            selected_key = "" if selected_org == "Unassigned" else selected_org.strip().casefold()
+            allowed_orgs = {selected_key}
+            if self.include_partner_orgs.get():
+                for link in all_links:
+                    source_org = (link["source_org"] or "").strip().casefold()
+                    target_org = (link["target_org"] or "").strip().casefold()
+                    if source_org == selected_key:
+                        allowed_orgs.add(target_org)
+                    if target_org == selected_key:
+                        allowed_orgs.add(source_org)
+            visible_devices = [device for device in all_devices
+                               if (device["organization"] or "").strip().casefold() in allowed_orgs]
+
+        visible_ids = {device["id"] for device in visible_devices}
+        links = [link for link in all_links
+                 if link["source_id"] in visible_ids and link["target_id"] in visible_ids]
+        if selected_org != "All organizations" and self.include_partner_orgs.get():
+            # Partner devices provide context, but only explicit edges that touch the
+            # selected organization belong in this filtered view. Do not show links
+            # solely between two devices in a partner organization.
+            links = [link for link in links
+                     if (link["source_org"] or "").strip().casefold() == selected_key
+                     or (link["target_org"] or "").strip().casefold() == selected_key]
         self.links.delete(*self.links.get_children())
         for link in links:
             source_ip = format_ip_address(link["source_ip"])
             target_ip = format_ip_address(link["target_ip"])
-            left = f"{link['source_host']}  ·  {source_ip}" if link["source_host"] else f"Unnamed device  ·  {source_ip}"
-            right = f"{link['target_host']}  ·  {target_ip}" if link["target_host"] else f"Unnamed device  ·  {target_ip}"
+            source_name = link["source_host"] or "Unnamed device"
+            target_name = link["target_host"] or "Unnamed device"
+            left = f"{link['source_org'].strip() or 'Unassigned'} · {source_name} · {source_ip}"
+            right = f"{link['target_org'].strip() or 'Unassigned'} · {target_name} · {target_ip}"
             self.links.insert("", "end", iid=str(link["id"]), values=(left, right, link["label"]))
+
         self.canvas.delete("all")
-        if not devices:
-            self.canvas.create_text(30, 35, anchor="nw", text="No devices yet. Add devices to start your connection map.", fill=self.map_colors["empty"], font=("Segoe UI", 11))
+        if not visible_devices:
+            prompt = "No devices match this organization filter." if all_devices else "No devices yet. Add devices to start your connection map."
+            self.canvas.create_text(30, 35, anchor="nw", text=prompt, fill=self.map_colors["empty"], font=("Segoe UI", 11))
             self.canvas.configure(scrollregion=(0, 0, 600, 180))
             return
-        display_addresses = {device["id"]: format_ip_address(device["ip_address"]) for device in devices}
+        display_addresses = {device["id"]: format_ip_address(device["ip_address"]) for device in visible_devices}
         longest_address = max(len(value) for value in display_addresses.values())
-        node_width = max(190, min(360, longest_address * 8 + 42))
+        node_width = max(210, min(380, longest_address * 8 + 54))
         cols = 4
         col_step = node_width + 65
-        row_step = 155
+        row_step = 175
         left_margin = 45
         positions = {}
-        for index, device in enumerate(devices):
+        for index, device in enumerate(visible_devices):
             x = left_margin + node_width / 2 + (index % cols) * col_step
-            y = 95 + (index // cols) * row_step
+            y = 105 + (index // cols) * row_step
             positions[device["id"]] = (x, y)
-        column_count = min(cols, len(devices))
-        row_count = (len(devices) + cols - 1) // cols
+        column_count = min(cols, len(visible_devices))
+        row_count = (len(visible_devices) + cols - 1) // cols
         width = int(left_margin * 2 + column_count * node_width + max(0, column_count - 1) * 65)
-        height = max(300, 145 + row_count * row_step)
+        height = max(320, 155 + row_count * row_step)
+        routed_lane_counts = {}
+        device_by_id = {device["id"]: device for device in visible_devices}
         for link in links:
             x1, y1 = positions[link["source_id"]]
             x2, y2 = positions[link["target_id"]]
-            self.canvas.create_line(x1, y1, x2, y2, fill=self.map_colors["link"], width=2, arrow="last")
-            self.canvas.create_text((x1+x2)/2, (y1+y2)/2 - 10, text=link["label"], fill=self.map_colors["label"], font=("Segoe UI", 8, "bold"), tags=("edge_label",))
-        for device in devices:
+            # If a same-row edge would pass behind another device, route it below
+            # that row so the unrelated device cannot look like an endpoint.
+            blocked = y1 == y2 and any(
+                device["id"] not in (link["source_id"], link["target_id"])
+                and positions[device["id"]][1] == y1
+                and min(x1, x2) < positions[device["id"]][0] < max(x1, x2)
+                for device in visible_devices
+            )
+            if blocked:
+                row_index = int((y1 - 105) // row_step)
+                lane_index = routed_lane_counts.get(row_index, 0)
+                routed_lane_counts[row_index] = lane_index + 1
+                lane_y = y1 + 68 + lane_index * 14
+                self.canvas.create_line(
+                    x1, y1 + 52, x1, lane_y, x2, lane_y, x2, y2 + 52,
+                    fill=self.map_colors["link"], width=2, arrow="last", joinstyle="round",
+                )
+                self.canvas.create_text((x1+x2)/2, lane_y - 10, text=link["label"], fill=self.map_colors["label"], font=("Segoe UI", 8, "bold"), tags=("edge_label",))
+                height = max(height, int(lane_y + 42))
+            else:
+                self.canvas.create_line(x1, y1, x2, y2, fill=self.map_colors["link"], width=2, arrow="last")
+                self.canvas.create_text((x1+x2)/2, (y1+y2)/2 - 10, text=link["label"], fill=self.map_colors["label"], font=("Segoe UI", 8, "bold"), tags=("edge_label",))
+        for device in visible_devices:
             x, y = positions[device["id"]]
-            self.canvas.create_rectangle(x-node_width/2, y-40, x+node_width/2, y+40, fill=self.map_colors["node"], outline=self.map_colors["outline"], width=2)
-            self.canvas.create_text(x, y-10, text=display_addresses[device["id"]], fill=self.map_colors["address"], font=("Segoe UI", 10, "bold"), width=node_width-24, justify="center")
+            self.canvas.create_rectangle(x-node_width/2, y-52, x+node_width/2, y+52, fill=self.map_colors["node"], outline=self.map_colors["outline"], width=2)
+            self.canvas.create_text(x, y-27, text=display_addresses[device["id"]], fill=self.map_colors["address"], font=("Segoe UI", 10, "bold"), width=node_width-24, justify="center")
             detail = device["hostname"] or device["device_type"] or "Device"
-            self.canvas.create_text(x, y+16, text=detail[:34], fill=self.map_colors["detail"], font=("Segoe UI", 8), width=node_width-24, justify="center")
+            self.canvas.create_text(x, y-3, text=detail[:34], fill=self.map_colors["detail"], font=("Segoe UI", 8), width=node_width-24, justify="center")
+            organization = (device["organization"] or "Unassigned").strip() or "Unassigned"
+            self.canvas.create_text(x, y+23, text=organization[:42], fill=self.map_colors["label"], font=("Segoe UI", 8, "bold"), width=node_width-24, justify="center")
         self.canvas.configure(scrollregion=(0, 0, width, height))
+
 class AssetInventoryApp(tk.Tk):
     COLUMNS = [("ip_address", "Host / IP", 150), ("device_type", "Device type", 125),
                ("hostname", "Preferred hostname", 180), ("organization", "Organization", 155),
@@ -491,6 +600,7 @@ class AssetInventoryApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
+        apply_app_icon(self)
         self.db = InventoryDB()
         self.active_inventory_file = None
         self.dirty = False
@@ -604,7 +714,8 @@ class AssetInventoryApp(tk.Tk):
         style.configure("TLabel", background=c["window"], foreground=c["text"], font=("Segoe UI", medium))
         style.configure("HeaderTitle.TLabel", background=c["header"], foreground="white", font=("Segoe UI", large + 11, "bold"))
         style.configure("HeaderSub.TLabel", background=c["header"], foreground="#b9ccef" if dark else "#dce7ff", font=("Segoe UI", small))
-        style.configure("HeaderLink.TLabel", background=c["header"], foreground="#ffffff", font=("Segoe UI", small, "underline"))
+        style.configure("HeaderPlain.TLabel", background=c["header"], foreground="#ffffff", font=("Segoe UI", small))
+        style.configure("HeaderLink.TLabel", background=c["header"], foreground="#ffffff", font=("Segoe UI", small))
         style.configure("Eyebrow.TLabel", background=c["header"], foreground="#7ca9ff" if dark else "#c2d7ff", font=("Segoe UI", max(7, small - 1), "bold"))
         style.configure("Title.TLabel", background=c["window"], font=("Segoe UI", large + 10, "bold"), foreground=c["title"])
         style.configure("Sub.TLabel", background=c["window"], font=("Segoe UI", small), foreground=c["muted"])
@@ -628,6 +739,8 @@ class AssetInventoryApp(tk.Tk):
         style.configure("PreferenceText.TLabel", background=c["card"], foreground=c["muted"], font=("Segoe UI", small))
         style.configure("TRadiobutton", background=c["card"], foreground=c["text"], font=("Segoe UI", medium))
         style.map("TRadiobutton", background=[("active", c["card"])], foreground=[("active", c["accent"])])
+        style.configure("OrgFilter.TCheckbutton", background=c["window"], foreground=c["text"], font=("Segoe UI", medium))
+        style.map("OrgFilter.TCheckbutton", background=[("active", c["window"])], foreground=[("active", c["accent"])])
 
     def apply_preferences(self):
         self._style()
@@ -650,11 +763,12 @@ class AssetInventoryApp(tk.Tk):
         ttk.Label(header_left, text="A clear view of your hosts, ownership, and network exposure.", style="HeaderSub.TLabel").pack(anchor="w", pady=(4, 0))
         header_right = ttk.Frame(header, style="Header.TFrame")
         header_right.pack(side="right", anchor="ne", padx=(16, 0))
-        github_link = ttk.Label(header_right, text="https://github.com/IEnduranceI", style="HeaderLink.TLabel", cursor="hand2")
-        github_link.pack(anchor="e")
-        github_link.bind("<Button-1>", self.open_github_profile)
+        github_text = ttk.Label(header_right, text="https://github.com/IEnduranceI", style="HeaderPlain.TLabel")
+        github_text.pack(anchor="e")
+        linkedin_text = ttk.Label(header_right, text="https://www.linkedin.com/in/laithu/", style="HeaderPlain.TLabel")
+        linkedin_text.pack(anchor="e", pady=(2, 0))
         self.stats = ttk.Label(header_right, text="", style="HeaderSub.TLabel")
-        self.stats.pack(anchor="e", pady=(10, 0))
+        self.stats.pack(anchor="e", pady=(8, 0))
         nav = ttk.Frame(shell)
         nav.pack(fill="x", pady=(0, 14))
         self.section = tk.StringVar(value="home")
@@ -679,10 +793,11 @@ class AssetInventoryApp(tk.Tk):
             "hosts": tk.StringVar(value="0"),
             "links": tk.StringVar(value="0"),
             "types": tk.StringVar(value="0"),
+            "organizations": tk.StringVar(value="0"),
         }
-        for index, (key, title) in enumerate((("hosts", "Hosts"), ("links", "Device connections"), ("types", "Device types"))):
+        for index, (key, title) in enumerate((("hosts", "Hosts"), ("links", "Device connections"), ("types", "Device types"), ("organizations", "Organizations"))):
             card = ttk.Frame(metrics, style="Metric.TFrame", padding=(18, 15))
-            card.grid(row=0, column=index, sticky="nsew", padx=(0 if index == 0 else 8, 8 if index < 2 else 0))
+            card.grid(row=0, column=index, sticky="nsew", padx=(0 if index == 0 else 8, 8 if index < 3 else 0))
             ttk.Label(card, text=title, style="MetricTitle.TLabel").pack(anchor="w")
             ttk.Label(card, textvariable=self.overview_count_vars[key], style="MetricValue.TLabel").pack(anchor="w", pady=(6, 0))
             metrics.columnconfigure(index, weight=1)
@@ -708,6 +823,18 @@ class AssetInventoryApp(tk.Tk):
         self.connection_summary.column("connection", width=220, anchor="w")
         self.connection_summary.column("count", width=90, anchor="center")
         self.connection_summary.pack(fill="both", expand=True)
+
+        organization_card = ttk.Frame(breakdown, style="Card.TFrame", padding=14)
+        organization_card.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        ttk.Label(organization_card, text="Devices & direct connections by organization", style="CardTitle.TLabel", wraplength=330).pack(anchor="w", pady=(0, 10))
+        self.overview_organization_summary = ttk.Treeview(organization_card, columns=("organization", "devices", "connections"), show="headings", height=14)
+        self.overview_organization_summary.heading("organization", text="Organization")
+        self.overview_organization_summary.heading("devices", text="Devices")
+        self.overview_organization_summary.heading("connections", text="Connections")
+        self.overview_organization_summary.column("organization", width=150, minwidth=100, anchor="w", stretch=True)
+        self.overview_organization_summary.column("devices", width=65, minwidth=55, anchor="center", stretch=False)
+        self.overview_organization_summary.column("connections", width=90, minwidth=80, anchor="center", stretch=False)
+        self.overview_organization_summary.pack(fill="both", expand=True)
 
         filters = ttk.Frame(self.home_panel, style="Card.TFrame", padding=14)
         filters.pack(fill="x", pady=(0, 14))
@@ -809,9 +936,6 @@ class AssetInventoryApp(tk.Tk):
             messagebox.showinfo("Import complete", f"Imported {count} devices from:\\n{path}", parent=self)
         except (OSError, json.JSONDecodeError, ValueError, sqlite3.Error) as exc:
             messagebox.showerror("Import failed", str(exc), parent=self)
-    def open_github_profile(self, _event=None):
-        webbrowser.open_new_tab("https://github.com/IEnduranceI")
-
     def open_connection_tree(self):
         existing = getattr(self, "connection_tree_window", None)
         if existing and existing.winfo_exists():
@@ -910,15 +1034,39 @@ class AssetInventoryApp(tk.Tk):
         host_count = self.db.conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
         link_count = self.db.conn.execute("SELECT COUNT(*) FROM device_links l JOIN devices a ON a.id=l.source_id JOIN devices b ON b.id=l.target_id").fetchone()[0]
         type_count = self.db.conn.execute("SELECT COUNT(DISTINCT COALESCE(NULLIF(TRIM(device_type), ''), 'Unspecified')) FROM devices").fetchone()[0]
+        organization_count = self.db.conn.execute("SELECT COUNT(DISTINCT COALESCE(NULLIF(TRIM(organization), ''), 'Unassigned')) FROM devices").fetchone()[0]
         self.overview_count_vars["hosts"].set(str(host_count))
         self.overview_count_vars["links"].set(str(link_count))
         self.overview_count_vars["types"].set(str(type_count))
+        self.overview_count_vars["organizations"].set(str(organization_count))
         self.type_summary.delete(*self.type_summary.get_children())
         for row in self.db.conn.execute("SELECT COALESCE(NULLIF(TRIM(device_type), ''), 'Unspecified') AS label, COUNT(*) AS total FROM devices GROUP BY label ORDER BY label COLLATE NOCASE"):
             self.type_summary.insert("", "end", values=(row["label"], row["total"]))
         self.connection_summary.delete(*self.connection_summary.get_children())
         for row in self.db.conn.execute("SELECT COALESCE(NULLIF(TRIM(connection), ''), 'Unspecified') AS label, COUNT(*) AS total FROM devices GROUP BY label ORDER BY label COLLATE NOCASE"):
             self.connection_summary.insert("", "end", values=(row["label"], row["total"]))
+
+        device_counts = {}
+        organization_names = {}
+        connection_counts = {}
+        for row in self.db.conn.execute("SELECT COALESCE(NULLIF(TRIM(organization), ''), 'Unassigned') AS label, COUNT(*) AS total FROM devices GROUP BY label ORDER BY label COLLATE NOCASE"):
+            key = row["label"].casefold()
+            organization_names[key] = row["label"]
+            device_counts[key] = row["total"]
+            connection_counts[key] = 0
+        for row in self.db.conn.execute("SELECT a.organization AS source_org, b.organization AS target_org FROM device_links l JOIN devices a ON a.id=l.source_id JOIN devices b ON b.id=l.target_id"):
+            source = (row["source_org"] or "").strip() or "Unassigned"
+            target = (row["target_org"] or "").strip() or "Unassigned"
+            source_key, target_key = source.casefold(), target.casefold()
+            organization_names.setdefault(source_key, source)
+            organization_names.setdefault(target_key, target)
+            for key in {source_key, target_key}:
+                connection_counts[key] = connection_counts.get(key, 0) + 1
+        self.overview_organization_summary.delete(*self.overview_organization_summary.get_children())
+        for key in sorted(organization_names, key=lambda item: organization_names[item].casefold()):
+            self.overview_organization_summary.insert("", "end", values=(
+                organization_names[key], device_counts.get(key, 0), connection_counts.get(key, 0)
+            ))
     def sort_by(self, key):
         items = [(self.tree.set(i, key).casefold(), i) for i in self.tree.get_children("")]
         reverse = getattr(self, "_sort_reverse", {}).get(key, False)
